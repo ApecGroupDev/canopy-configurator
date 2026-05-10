@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Streamlit app
+        continue-on-error: true
         run: |
           echo "Pinging Streamlit app..."
           curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" https://canopy-configurator.streamlit.app/ || true
           echo "Ping sent successfully"
-        continue-on-error: true

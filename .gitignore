@@ -3,3 +3,10 @@ __pycache__/
 .venv/
 .env
 quote_tracker.csv
+
+# Google service-account credentials — must never be committed.
+# Live in Streamlit Cloud secrets only.
+*.json
+!.devcontainer/devcontainer.json
+!package.json
+canopy-tracker-*.json

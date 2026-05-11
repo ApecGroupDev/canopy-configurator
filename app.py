@@ -1,22 +1,38 @@
 """
-Canopy Pricing Configurator — Streamlit app (v6)
+Canopy Pricing Configurator — Streamlit app (v8 — server-side profitability tracker)
 Reads all rates, cheat sheets, and defaults from canopy_config.xlsx (same folder).
-Spec: 14 corrections through 2026-05-10. v6 adds GEO Canopies logo swap.
+Spec: 14 corrections through 2026-05-10. v8 adds quote_tracker.csv + admin panel.
 
 Run locally:
     streamlit run canopy_configurator.py
 """
 
+import csv
+import datetime as dt
 import math
+import os
+import tempfile
 from pathlib import Path
 
 import streamlit as st
 from openpyxl import load_workbook
 
+from proposal_writer import build_proposal
+
 CONFIG_PATH = Path(__file__).parent / "canopy_config.xlsx"
 APEC_LOGO   = Path(__file__).parent / "Apec Imaging Logo.jpg"
 GEO_LOGO    = Path(__file__).parent / "GEO Canopies logo.jpg"
-PASSWORD = "cheap"
+PASSWORD = "cheap"          # GP-override password (existing)
+# Admin password — gates the Profitability Tracker view at the bottom of the
+# app. CHANGE THIS to whatever you want. Keep it different from PASSWORD so
+# GP-override leakage doesn't expose margins.
+ADMIN_PASSWORD = "profit_tracker"
+
+# Server-side append-only log of every proposal generated. Lives next to the
+# app on the web server; downloaded via the admin section.
+TRACKER_PATH = Path(__file__).parent / "quote_tracker.csv"
+TRACKER_COLUMNS = ["Date", "Quote No", "Customer Name", "City",
+                   "Sales Rep", "Grand Total", "Profitability"]
 
 US_STATES = [
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
@@ -30,6 +46,12 @@ US_STATES = [
 def load_config():
     wb = load_workbook(CONFIG_PATH, data_only=True)
     c = {}
+
+    def _num(cell, fallback):
+        """Return cell value if it's numeric (cost column), else fallback (selling).
+        Guards against placeholder strings like '(value is cost)' in unfilled cells."""
+        v = cell.value if hasattr(cell, "value") else cell
+        return v if isinstance(v, (int, float)) and v is not False else fallback
 
     s = wb["Settings"]
     c["canopy_height_default_ft"]    = s["B3"].value
@@ -53,6 +75,11 @@ def load_config():
     c["branded_labor_adder"]         = s["B18"].value
     c["two_disp_labor_adder"]        = s["B19"].value
     c["shipping_handling"]           = s["B20"].value
+    # True costs for at-cost adders + shipping (fall back to selling = no profit)
+    c["branded_labor_adder_cost"]    = _num(s["C18"], s["B18"].value)
+    c["two_disp_labor_adder_cost"]   = _num(s["C19"], s["B19"].value)
+    c["shipping_handling_cost"]      = _num(s["C20"], s["B20"].value)
+    c["labor_daily_rate_cost"]       = _num(s["C17"], c["labor_daily_rate"])
 
     m = wb["Material_Rates"]
     c["acm_per_panel"]   = m["B3"].value
@@ -60,10 +87,22 @@ def load_config():
     c["steel_secondary"] = m["B5"].value
     c["decking_per_col"] = m["B6"].value
     c["light_unit_price"]= m["B7"].value
+    # True-cost mirrors of the above (fall back to selling if Excel column C empty)
+    c["acm_per_panel_cost"]    = _num(m["C3"], m["B3"].value)
+    c["steel_primary_cost"]    = _num(m["C4"], m["B4"].value)
+    c["steel_secondary_cost"]  = _num(m["C5"], m["B5"].value)
+    c["decking_per_col_cost"]  = _num(m["C6"], m["B6"].value)
+    c["light_unit_price_cost"] = _num(m["C7"], m["B7"].value)
 
     mt = wb["MISC_Tiers"]
+    # selling tiers (col C) and parallel cost tiers (col D, fall back to col C)
     c["misc_tiers"] = [
         (mt.cell(r, 1).value, mt.cell(r, 2).value, mt.cell(r, 3).value)
+        for r in range(3, 6) if mt.cell(r, 1).value is not None
+    ]
+    c["misc_tiers_cost"] = [
+        (mt.cell(r, 1).value, mt.cell(r, 2).value,
+         _num(mt.cell(r, 4), mt.cell(r, 3).value))
         for r in range(3, 6) if mt.cell(r, 1).value is not None
     ]
 
@@ -87,18 +126,22 @@ def load_config():
         c["brand_imaging"][brand] = prices
 
     mp = wb["MID_PriceSign"]
-    c["mid_prices"] = {}
+    c["mid_prices"]      = {}
+    c["mid_prices_cost"] = {}
     for r in range(3, 8):
         brand, price = mp.cell(r, 1).value, mp.cell(r, 2).value
         if brand and price is not None:
             c["mid_prices"][brand] = price
+            c["mid_prices_cost"][brand] = _num(mp.cell(r, 3), price)
 
     ml = wb["MID_Labor"]
-    c["mid_labor"] = {}
+    c["mid_labor"]      = {}
+    c["mid_labor_cost"] = {}
     for r in range(3, 5):
         st_code, amt = ml.cell(r, 1).value, ml.cell(r, 2).value
         if st_code and amt is not None:
             c["mid_labor"][st_code] = amt
+            c["mid_labor_cost"][st_code] = _num(ml.cell(r, 3), amt)
 
     sp = wb["Salespeople"]
     c["salespeople"] = {}
@@ -137,6 +180,13 @@ def lookup_misc(columns, cfg):
     for lo, hi, price in cfg["misc_tiers"]:
         if lo <= columns <= hi:
             return price
+    return 0
+
+
+def lookup_misc_cost(columns, cfg):
+    for lo, hi, cost in cfg["misc_tiers_cost"]:
+        if lo <= columns <= hi:
+            return cost
     return 0
 
 
@@ -202,6 +252,44 @@ def compute_quote(*, dispensers, canopy_type, double_col, branded, brand_name,
     labor_cost    = marked_up_labor + at_cost_labor
     final = retail_material + retail_labor + tax
 
+    # ── True-cost & profitability ──────────────────────────────────────
+    acm_cost = 0 if branded else compute_acm(width, depth, cfg) * (
+        cfg["acm_per_panel_cost"] / cfg["acm_per_panel"]
+        if cfg["acm_per_panel"] else 0
+    )
+    steel_primary_cost = dispensers * cfg["steel_primary_cost"]
+    decking_cost       = columns * cfg["decking_per_col_cost"]
+    lights_cost        = dispensers * 4 * cfg["light_unit_price_cost"]
+    misc_cost          = lookup_misc_cost(columns, cfg)
+    steel_secondary_cost = (dispensers * cfg["steel_secondary_cost"]
+                            if (canopy_type == "Dive-in" and double_col) else 0)
+    shipping_cost      = cfg["shipping_handling_cost"] if branded else 0
+    # Brand imaging: pure pass-through, selling = true cost
+    brand_imaging_cost = brand_imaging_amt
+    mid_material_cost  = (cfg["mid_prices_cost"].get(mid_brand, mid_material)
+                          if include_mid and mid_brand else 0)
+    base_labor_cost    = days * cfg["labor_daily_rate_cost"]
+    branded_labor_add_cost  = cfg["branded_labor_adder_cost"] if branded else 0
+    two_disp_labor_add_cost = cfg["two_disp_labor_adder_cost"] if dispensers == 2 else 0
+    # MID labor: cost lookup by state where available; otherwise fall back to
+    # the actual labor amount applied (preserves correctness for custom states)
+    if include_mid:
+        cust_state_default = None  # configurator passes labor amount directly
+        mid_labor_cost = mid_labor_amt  # treat MID labor as at-cost pass-through
+    else:
+        mid_labor_cost = 0
+
+    true_cost_material = (acm_cost + steel_primary_cost + decking_cost + lights_cost
+                          + misc_cost + steel_secondary_cost + shipping_cost
+                          + brand_imaging_cost + mid_material_cost)
+    true_cost_labor    = (base_labor_cost + branded_labor_add_cost
+                          + two_disp_labor_add_cost + mid_labor_cost)
+    true_cost_total    = true_cost_material + true_cost_labor
+
+    # Revenue excludes tax (pass-through to taxing authority)
+    revenue = retail_material + retail_labor
+    profit  = revenue - true_cost_total
+
     return {
         "material_cost":    material_cost,
         "labor_cost":       labor_cost,
@@ -214,7 +302,139 @@ def compute_quote(*, dispensers, canopy_type, double_col, branded, brand_name,
         "columns":          columns,
         "labor_days":       days,
         "items_not_included": items_not_included,
+        # Per-component costs — consumed by proposal_builder for retail line items.
+        "acm":                acm,
+        "steel":              steel_primary,
+        "decking":            decking,
+        "lights":             lights,
+        "misc":               misc,
+        "steel_secondary":    steel_secondary,
+        "shipping":           shipping,
+        "brand_imaging":      brand_imaging_amt,
+        "mid_material":       mid_material,
+        "base_labor":         base_labor,
+        "branded_labor_add":  branded_add,
+        "two_disp_labor_add": two_disp_add,
+        "mid_labor":          mid_labor_total,
+        # Profitability fields
+        "revenue":            revenue,
+        "true_cost":          true_cost_total,
+        "profit":             profit,
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Proposal generation helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _build_proposal_data(q):
+    """Translate Streamlit-session quote snapshot → proposal_builder data dict."""
+    r = q["result"]
+    return {
+        "company_key":  q["company_key"],
+        "quote_number": q["quote_number"],
+        "quote_date":   q["quote_date"],
+        "customer": {
+            "company": q["cust_company"], "name":  q["cust_name"],
+            "phone":   q["cust_phone"],   "email": q["cust_email"],
+            "street":  q["cust_street"],  "city":  q["cust_city"],
+            "state":   q["cust_state"],   "zip":   q["cust_zip"],
+        },
+        "sales_person": {
+            "name":  q["sales_person"],
+            "phone": q["sales_info"]["phone"],
+            "email": q["sales_info"]["email"],
+        },
+        "canopy": {
+            "type":        q["canopy_type"],
+            "branded":     q["branded"],
+            "brand_name":  q["brand_name"] or "",
+            "double_col":  q["double_col"],
+            "dispensers":  q["dispensers"],
+            "columns":     r["columns"],
+            "width":       q["width"],
+            "depth":       q["depth"],
+            "distance":    q["distance"],
+            "overhang":    q["overhang"],
+            "labor_days":  r["labor_days"],
+        },
+        "mid": {
+            "include": q["include_mid"],
+            "brand":   q["mid_brand"],
+        },
+        "pricing": {
+            "gp_rate":            q["gp_rate"],
+            "tax_rate":           q["tax_rate"],
+            "acm":                r["acm"],
+            "steel":              r["steel"],
+            "decking":            r["decking"],
+            "lights":             r["lights"],
+            "misc":               r["misc"],
+            "steel_secondary":    r["steel_secondary"],
+            "shipping":           r["shipping"],
+            "brand_imaging":      r["brand_imaging"],
+            "mid_material":       r["mid_material"],
+            "base_labor":         r["base_labor"],
+            "branded_labor_add":  r["branded_labor_add"],
+            "two_disp_labor_add": r["two_disp_labor_add"],
+            "mid_labor":          r["mid_labor"],
+            "items_not_included": r["items_not_included"],
+        },
+    }
+
+
+def _docx_to_bytes(data):
+    """Run build_proposal() to a temp file, return the docx bytes."""
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        tmp = tf.name
+    try:
+        build_proposal(data, tmp)
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _next_quote_number():
+    """Return next sequential quote number based on rows in TRACKER_PATH.
+    Format: Q-YYYYMMDD-NNN with NNN = max existing today + 1 (else 001)."""
+    today = dt.date.today().strftime("%Y%m%d")
+    prefix = f"Q-{today}-"
+    max_seq = 0
+    if TRACKER_PATH.exists():
+        try:
+            with open(TRACKER_PATH, encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader, None)  # skip header
+                for row in reader:
+                    if len(row) >= 2 and row[1].startswith(prefix):
+                        try:
+                            max_seq = max(max_seq, int(row[1].split("-")[-1]))
+                        except (ValueError, IndexError):
+                            pass
+        except Exception:
+            pass  # corrupt tracker → start fresh
+    return f"{prefix}{max_seq + 1:03d}"
+
+
+def _log_quote_to_tracker(q):
+    """Append a single row to the profitability tracker CSV."""
+    r = q["result"]
+    is_new = not TRACKER_PATH.exists()
+    with open(TRACKER_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(TRACKER_COLUMNS)
+        w.writerow([
+            q["quote_date"],
+            q["quote_number"],
+            q["cust_company"],
+            q["cust_city"],
+            q["sales_person"],
+            f'{r["final"]:.2f}',
+            f'{r["profit"]:.2f}',
+        ])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -441,12 +661,46 @@ if calc:
     if mid_jobber_note:
         result["items_not_included"].append(mid_jobber_note)
 
+    # Snapshot inputs + result so display and proposal both see the SAME data.
+    # Quote number is NOT assigned here — only when Generate Proposal is clicked
+    # (sequential, server-wide; pulled from the tracker file at that moment).
+    st.session_state["last_quote"] = {
+        "result":         result,
+        "company_key":    company_key,
+        "brand_company":  brand_company,
+        "cust_company":   cust_company, "cust_name":  cust_name,
+        "cust_phone":     cust_phone,   "cust_email": cust_email,
+        "cust_street":    cust_street,  "cust_city":  cust_city,
+        "cust_state":     cust_state,   "cust_zip":   cust_zip,
+        "sales_person":   sales_person, "sales_info": sales_info,
+        "canopy_type":    canopy_type,  "branded":    branded,
+        "brand_name":     brand_name,   "double_col": double_col,
+        "include_mid":    include_mid,  "mid_brand":  mid_brand,
+        "dispensers":     dispensers,   "width":      width,
+        "depth":          depth,        "distance":   distance,
+        "overhang":       overhang,
+        "tax_rate":       tax_rate,     "tax_rate_pct": tax_rate_pct,
+        "gp_rate":        gp,
+        "quote_number":   None,  # assigned by _next_quote_number() on Generate
+        "quote_date":     dt.date.today().strftime("%B %d, %Y"),
+    }
+    # New calc invalidates any previously generated proposal + quote-logged flag.
+    st.session_state.pop("proposal_bytes", None)
+    st.session_state.pop("proposal_filename", None)
+    st.session_state.pop("quote_logged", None)
+
+
+# ── Display + Generate Proposal — driven by the snapshot ────────────────────
+if "last_quote" in st.session_state:
+    q = st.session_state["last_quote"]
+    result = q["result"]
+
     st.markdown('<div class="section-title">Quote Result</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div class="cost-card">'
         f'<div class="label">Canopy Cost (internal)</div>'
         f'<div class="value">Material: ${result["material_cost"]:,.2f} '
-        f'&nbsp;|&nbsp; Labor: ${result["labor_cost"]:,.2f}</div>'
+        f'&nbsp;|&nbsp; Installation: ${result["labor_cost"]:,.2f}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -456,8 +710,8 @@ if calc:
         f'<div class="value">${result["retail_total"]:,.2f}</div>'
         f'<div style="margin-top:8px;font-size:0.95rem;color:#cde4f7;">'
         f'Material: ${result["retail_material"]:,.2f} &nbsp;|&nbsp; '
-        f'Labor: ${result["retail_labor"]:,.2f} &nbsp;|&nbsp; '
-        f'Tax ({tax_rate_pct:.2f}%): ${result["tax"]:,.2f}</div>'
+        f'Installation: ${result["retail_labor"]:,.2f} &nbsp;|&nbsp; '
+        f'Tax ({q["tax_rate_pct"]:.2f}%): ${result["tax"]:,.2f}</div>'
         f'<div style="margin-top:14px;font-size:1.1rem;font-weight:700;">'
         f'Final Price for Customer: ${result["final"]:,.2f}</div>'
         f'</div>',
@@ -465,21 +719,22 @@ if calc:
     )
 
     st.markdown('<div class="section-title">Project Summary</div>', unsafe_allow_html=True)
-    col_arr_label = ("Double column" if (canopy_type == "Dive-in" and double_col) else "Single column")
+    col_arr_label = ("Double column" if (q["canopy_type"] == "Dive-in" and q["double_col"])
+                     else "Single column")
     summary = [
-        ("Quote for", brand_company),
-        ("Customer", f"{cust_company} — {cust_name}"),
-        ("Customer contact", f"{cust_phone} | {cust_email}"),
-        ("Site address", f"{cust_street}, {cust_city}, {cust_state} {cust_zip}"),
-        ("Sales person", f"{sales_person} ({sales_info['phone']} | {sales_info['email']})"),
-        ("Canopy type", f"{canopy_type} ({col_arr_label})" if canopy_type == "Dive-in" else canopy_type),
-        ("Branded?", f"Yes — {brand_name}" if branded else "No"),
-        ("MID / Price sign?", f"Yes — {mid_brand}" if (include_mid and mid_brand) else ("Yes — jobber-supplied" if include_mid else "No")),
-        ("Dispensers / Columns", f"{dispensers} / {result['columns']}"),
-        ("Width × Depth", f"{width:.0f} ft × {depth:.0f} ft"),
-        ("Square footage", f"{int(width*depth):,} sq ft"),
-        ("Labor days", result["labor_days"]),
-        ("Tax rate", f"{tax_rate_pct:.2f}%"),
+        ("Quote for", q["brand_company"]),
+        ("Customer", f'{q["cust_company"]} — {q["cust_name"]}'),
+        ("Customer contact", f'{q["cust_phone"]} | {q["cust_email"]}'),
+        ("Site address", f'{q["cust_street"]}, {q["cust_city"]}, {q["cust_state"]} {q["cust_zip"]}'),
+        ("Sales person", f'{q["sales_person"]} ({q["sales_info"]["phone"]} | {q["sales_info"]["email"]})'),
+        ("Canopy type", f'{q["canopy_type"]} ({col_arr_label})' if q["canopy_type"] == "Dive-in" else q["canopy_type"]),
+        ("Branded?", f'Yes — {q["brand_name"]}' if q["branded"] else "No"),
+        ("Price sign?", f'Yes — {q["mid_brand"]}' if (q["include_mid"] and q["mid_brand"]) else ("Yes — jobber-supplied" if q["include_mid"] else "No")),
+        ("Dispensers / Columns", f'{q["dispensers"]} / {result["columns"]}'),
+        ("Width × Depth", f'{q["width"]:.0f} ft × {q["depth"]:.0f} ft'),
+        ("Square footage", f'{int(q["width"]*q["depth"]):,} sq ft'),
+        ("Installation days", result["labor_days"]),
+        ("Tax rate", f'{q["tax_rate_pct"]:.2f}%'),
     ]
     for k, v in summary:
         st.markdown(
@@ -501,3 +756,75 @@ if calc:
         '</div>',
         unsafe_allow_html=True,
     )
+
+    # ── Generate Proposal ────────────────────────────────────────────────
+    st.markdown('<div class="section-title">Generate Proposal</div>', unsafe_allow_html=True)
+    gen = st.button("📄 Generate Word Proposal", use_container_width=True)
+    if gen:
+        # First Generate on a fresh calc → assign quote# and log to tracker.
+        # Subsequent Generate clicks on the same calc reuse the same number
+        # and skip logging (no duplicate rows).
+        if not st.session_state.get("quote_logged"):
+            q["quote_number"] = _next_quote_number()
+            st.session_state["last_quote"] = q
+            try:
+                _log_quote_to_tracker(q)
+                st.session_state["quote_logged"] = True
+            except Exception as e:
+                st.warning(f"Quote tracker append failed (proposal still generated): {e}")
+        data = _build_proposal_data(q)
+        try:
+            st.session_state["proposal_bytes"] = _docx_to_bytes(data)
+            st.session_state["proposal_filename"] = f'Proposal_{q["quote_number"]}.docx'
+            st.success(f'Proposal generated — {q["quote_number"]}.')
+        except Exception as e:
+            st.error(f"Could not generate proposal: {e}")
+
+    if "proposal_bytes" in st.session_state:
+        st.download_button(
+            "⬇️ Download Proposal (.docx)",
+            data=st.session_state["proposal_bytes"],
+            file_name=st.session_state["proposal_filename"],
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
+            use_container_width=True,
+        )
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Profitability Tracker — admin view at bottom of page (password-gated).
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+with st.expander("🔒 Profitability Tracker (admin)"):
+    admin_pw = st.text_input("Admin password", type="password", key="admin_pw")
+    if admin_pw == ADMIN_PASSWORD:
+        if TRACKER_PATH.exists():
+            try:
+                with open(TRACKER_PATH, "rb") as _f:
+                    tracker_bytes = _f.read()
+                # Parse for display (preview)
+                rows = list(csv.reader(tracker_bytes.decode("utf-8").splitlines()))
+                if len(rows) >= 2:
+                    header, data_rows = rows[0], rows[1:]
+                    # Newest on top
+                    data_rows = list(reversed(data_rows))
+                    table_data = [dict(zip(header, r)) for r in data_rows]
+                    st.markdown(f"**{len(data_rows)} quote(s) logged.**")
+                    st.dataframe(table_data, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Tracker file exists but is empty.")
+                st.download_button(
+                    "⬇️ Download Tracker (.csv)",
+                    data=tracker_bytes,
+                    file_name=f"quote_tracker_{dt.date.today()}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Tracker read error: {e}")
+        else:
+            st.info("No quotes logged yet — tracker file will appear here after "
+                    "the first proposal is generated.")
+    elif admin_pw:
+        st.error("Incorrect admin password.")

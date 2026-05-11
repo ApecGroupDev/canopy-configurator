@@ -1,7 +1,9 @@
 """
-Canopy Pricing Configurator — Streamlit app (v8 — server-side profitability tracker)
+Canopy Pricing Configurator — Streamlit app (v9 — Google Sheets quote tracker)
 Reads all rates, cheat sheets, and defaults from canopy_config.xlsx (same folder).
-Spec: 14 corrections through 2026-05-10. v8 adds quote_tracker.csv + admin panel.
+Spec: 14 corrections through 2026-05-10. v9 swaps the local CSV tracker for a
+Google Sheets backend (Streamlit Community Cloud has ephemeral storage that
+wipes the CSV on every restart).
 
 Run locally:
     streamlit run canopy_configurator.py
@@ -9,6 +11,7 @@ Run locally:
 
 import csv
 import datetime as dt
+import io
 import math
 import os
 import tempfile
@@ -19,6 +22,15 @@ from openpyxl import load_workbook
 
 from proposal_writer import build_proposal
 
+# Google Sheets backend (production). Falls back to local CSV when creds aren't
+# configured (e.g., local dev), so the app still runs without google deps.
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    _HAS_GSPREAD = True
+except ImportError:
+    _HAS_GSPREAD = False
+
 CONFIG_PATH = Path(__file__).parent / "canopy_config.xlsx"
 APEC_LOGO   = Path(__file__).parent / "Apec Imaging Logo.jpg"
 GEO_LOGO    = Path(__file__).parent / "GEO Canopies logo.jpg"
@@ -28,11 +40,47 @@ PASSWORD = "cheap"          # GP-override password (existing)
 # GP-override leakage doesn't expose margins.
 ADMIN_PASSWORD = "profit_tracker"
 
-# Server-side append-only log of every proposal generated. Lives next to the
-# app on the web server; downloaded via the admin section.
-TRACKER_PATH = Path(__file__).parent / "quote_tracker.csv"
-TRACKER_COLUMNS = ["Date", "Quote No", "Customer Name", "City",
-                   "Sales Rep", "Grand Total", "Profitability"]
+# ─── Quote tracker storage ─────────────────────────────────────────────────
+# Production: Google Sheet on Ali's personal Drive.
+# Local dev: falls back to CSV next to the app if no Streamlit secrets present.
+SHEET_ID         = "1pnfCv70Y4UBWw8A2Yi49QBvr2ErwRDy7raxPdkGkC1w"
+WORKSHEET_NAME   = "Tracker"
+TRACKER_PATH     = Path(__file__).parent / "quote_tracker.csv"  # local-dev fallback
+TRACKER_COLUMNS  = ["Date", "Quote No", "Customer Name", "City",
+                    "Sales Rep", "Grand Total", "Profitability"]
+GSHEETS_SCOPES   = ["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"]
+
+
+@st.cache_resource(show_spinner=False)
+def _get_tracker_sheet():
+    """Return a gspread worksheet handle, or None if creds aren't available.
+    When None is returned, callers fall back to the local CSV path."""
+    if not _HAS_GSPREAD:
+        return None
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        return None  # No secrets configured → CSV fallback
+    try:
+        creds = Credentials.from_service_account_info(creds_dict, scopes=GSHEETS_SCOPES)
+        gc    = gspread.authorize(creds)
+        sh    = gc.open_by_key(SHEET_ID)
+        try:
+            ws = sh.worksheet(WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=WORKSHEET_NAME,
+                                  rows=1000, cols=len(TRACKER_COLUMNS))
+            ws.append_row(TRACKER_COLUMNS, value_input_option="USER_ENTERED")
+        # Ensure header row is present (in case sheet was wiped manually)
+        if not ws.row_values(1):
+            ws.append_row(TRACKER_COLUMNS, value_input_option="USER_ENTERED")
+        return ws
+    except Exception as e:
+        # Surface auth/permission errors so the rep notices, but don't crash
+        # the app — fall back to CSV so quotes still get logged somewhere.
+        st.warning(f"Google Sheets tracker unavailable ({e}); using local CSV fallback.")
+        return None
 
 US_STATES = [
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
@@ -397,12 +445,26 @@ def _docx_to_bytes(data):
 
 
 def _next_quote_number():
-    """Return next sequential quote number based on rows in TRACKER_PATH.
-    Format: Q-YYYYMMDD-NNN with NNN = max existing today + 1 (else 001)."""
-    today = dt.date.today().strftime("%Y%m%d")
+    """Return next sequential quote number based on existing tracker rows.
+    Format: Q-YYYYMMDD-NNN with NNN = max existing today + 1 (else 001).
+    Reads from Google Sheet in production, falls back to CSV locally."""
+    today  = dt.date.today().strftime("%Y%m%d")
     prefix = f"Q-{today}-"
     max_seq = 0
-    if TRACKER_PATH.exists():
+
+    ws = _get_tracker_sheet()
+    if ws is not None:
+        try:
+            quote_col = ws.col_values(2)[1:]  # column B = "Quote No", skip header
+            for v in quote_col:
+                if v and v.startswith(prefix):
+                    try:
+                        max_seq = max(max_seq, int(v.split("-")[-1]))
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass  # sheet unreachable mid-session → start fresh today
+    elif TRACKER_PATH.exists():
         try:
             with open(TRACKER_PATH, encoding="utf-8") as f:
                 reader = csv.reader(f)
@@ -419,22 +481,29 @@ def _next_quote_number():
 
 
 def _log_quote_to_tracker(q):
-    """Append a single row to the profitability tracker CSV."""
+    """Append a single row to the profitability tracker.
+    Uses Google Sheet in production, falls back to local CSV when no creds."""
     r = q["result"]
+    row = [
+        q["quote_date"],
+        q["quote_number"],
+        q["cust_company"],
+        q["cust_city"],
+        q["sales_person"],
+        f'{r["final"]:.2f}',
+        f'{r["profit"]:.2f}',
+    ]
+    ws = _get_tracker_sheet()
+    if ws is not None:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return
+    # CSV fallback
     is_new = not TRACKER_PATH.exists()
     with open(TRACKER_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if is_new:
             w.writerow(TRACKER_COLUMNS)
-        w.writerow([
-            q["quote_date"],
-            q["quote_number"],
-            q["cust_company"],
-            q["cust_city"],
-            q["sales_person"],
-            f'{r["final"]:.2f}',
-            f'{r["profit"]:.2f}',
-        ])
+        w.writerow(row)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -799,32 +868,48 @@ st.markdown("---")
 with st.expander("🔒 Profitability Tracker (admin)"):
     admin_pw = st.text_input("Admin password", type="password", key="admin_pw")
     if admin_pw == ADMIN_PASSWORD:
-        if TRACKER_PATH.exists():
-            try:
-                with open(TRACKER_PATH, "rb") as _f:
-                    tracker_bytes = _f.read()
-                # Parse for display (preview)
-                rows = list(csv.reader(tracker_bytes.decode("utf-8").splitlines()))
-                if len(rows) >= 2:
-                    header, data_rows = rows[0], rows[1:]
-                    # Newest on top
-                    data_rows = list(reversed(data_rows))
-                    table_data = [dict(zip(header, r)) for r in data_rows]
-                    st.markdown(f"**{len(data_rows)} quote(s) logged.**")
-                    st.dataframe(table_data, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Tracker file exists but is empty.")
-                st.download_button(
-                    "⬇️ Download Tracker (.csv)",
-                    data=tracker_bytes,
-                    file_name=f"quote_tracker_{dt.date.today()}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
+        ws = _get_tracker_sheet()
+        rows = []
+        source_label = ""
+        try:
+            if ws is not None:
+                rows = ws.get_all_values()
+                source_label = "Google Sheets"
+                st.markdown(
+                    f"**Source:** [Open tracker in Google Sheets ↗]"
+                    f"(https://docs.google.com/spreadsheets/d/{SHEET_ID})"
                 )
-            except Exception as e:
-                st.error(f"Tracker read error: {e}")
+            elif TRACKER_PATH.exists():
+                with open(TRACKER_PATH, encoding="utf-8") as _f:
+                    rows = list(csv.reader(_f))
+                source_label = "Local CSV (fallback — Google Sheets not configured)"
+                st.markdown(f"**Source:** {source_label}")
+        except Exception as e:
+            st.error(f"Tracker read error: {e}")
+            rows = []
+
+        if len(rows) >= 2:
+            header, data_rows = rows[0], rows[1:]
+            # Newest on top
+            display_rows = list(reversed(data_rows))
+            table_data = [dict(zip(header, r)) for r in display_rows]
+            st.markdown(f"**{len(data_rows)} quote(s) logged.**")
+            st.dataframe(table_data, use_container_width=True, hide_index=True)
+            # Build CSV bytes for download (chronological order preserved)
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(header)
+            for r_ in data_rows:
+                w.writerow(r_)
+            st.download_button(
+                "⬇️ Download Tracker (.csv)",
+                data=buf.getvalue().encode("utf-8"),
+                file_name=f"quote_tracker_{dt.date.today()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
         else:
-            st.info("No quotes logged yet — tracker file will appear here after "
-                    "the first proposal is generated.")
+            st.info("No quotes logged yet — tracker will populate after the "
+                    "first proposal is generated.")
     elif admin_pw:
         st.error("Incorrect admin password.")

@@ -2,16 +2,36 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # Every 6 hours — frequent enough to prevent sleep (7-day inactivity limit)
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
   ping-app:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Streamlit app
-        continue-on-error: true
+      - name: Install Playwright + Chromium
         run: |
-          echo "Pinging Streamlit app..."
-          curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" https://canopy-configurator.streamlit.app/ || true
-          echo "Ping sent successfully"
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Visit Streamlit app with headless browser
+        run: |
+          python - <<'EOF'
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch()
+                  page = await browser.new_page()
+                  print("Navigating to app...")
+                  await page.goto("https://canopy-configurator.streamlit.app/", timeout=60000)
+                  # Wait for Streamlit to fully connect (WebSocket established)
+                  await page.wait_for_selector("[data-testid='stAppViewContainer']", timeout=60000)
+                  print("App loaded and WebSocket connected successfully.")
+                  await asyncio.sleep(5)
+                  await browser.close()
+
+          asyncio.run(main())
+          EOF

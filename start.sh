@@ -15,7 +15,7 @@ else
 fi
 
 # Start Streamlit
-exec streamlit run app.py \
+exec streamlit run canopy_configurator.py \
     --server.port "${PORT:-8501}" \
     --server.address 0.0.0.0 \
     --server.headless true
